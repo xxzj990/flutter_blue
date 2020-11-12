@@ -7,14 +7,6 @@ part of flutter_blue;
 class FlutterBlue {
   final MethodChannel _channel = const MethodChannel('$NAMESPACE/methods');
   final EventChannel _stateChannel = const EventChannel('$NAMESPACE/state');
-  final EventChannel _scanResultChannel =
-      const EventChannel('$NAMESPACE/scanResult');
-  final EventChannel _servicesDiscoveredChannel =
-      const EventChannel('$NAMESPACE/servicesDiscovered');
-  final EventChannel _characteristicReadChannel =
-      const EventChannel('$NAMESPACE/characteristicRead');
-  final EventChannel _descriptorReadChannel =
-      const EventChannel('$NAMESPACE/descriptorRead');
   final StreamController<MethodCall> _methodStreamController =
       new StreamController.broadcast(); // ignore: close_sinks
   Stream<MethodCall> get _methodStream => _methodStreamController
@@ -24,11 +16,12 @@ class FlutterBlue {
   FlutterBlue._() {
     _channel.setMethodCallHandler((MethodCall call) {
       _methodStreamController.add(call);
+      return;
     });
 
-    // Send the log level to the underlying platforms.
-    setLogLevel(logLevel);
+    _setLogLevelIfAvailable();
   }
+
   static FlutterBlue _instance = new FlutterBlue._();
   static FlutterBlue get instance => _instance;
 
@@ -43,111 +36,153 @@ class FlutterBlue {
   /// Checks if Bluetooth functionality is turned on
   Future<bool> get isOn => _channel.invokeMethod('isOn').then<bool>((d) => d);
 
+  BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
+  Stream<bool> get isScanning => _isScanning.stream;
+
+  BehaviorSubject<List<ScanResult>> _scanResults = BehaviorSubject.seeded([]);
+  
+  /// Returns a stream that is a list of [ScanResult] results while a scan is in progress.
+  ///
+  /// The list emitted is all the scanned results as of the last initiated scan. When a scan is
+  /// first started, an empty list is emitted. The returned stream is never closed.
+  ///
+  /// One use for [scanResults] is as the stream in a StreamBuilder to display the
+  /// results of a scan in real time while the scan is in progress.
+  Stream<List<ScanResult>> get scanResults => _scanResults.stream;
+
+  PublishSubject _stopScanPill = new PublishSubject();
+
   /// Gets the current state of the Bluetooth module
-  Future<BluetoothState> get state {
-    return _channel
+  Stream<BluetoothState> get state async* {
+    yield await _channel
         .invokeMethod('state')
         .then((buffer) => new protos.BluetoothState.fromBuffer(buffer))
         .then((s) => BluetoothState.values[s.state.value]);
-  }
 
-  /// Occurs when the bluetooth state has changed
-  Stream<BluetoothState> onStateChanged() {
-    return _stateChannel
+    yield* _stateChannel
         .receiveBroadcastStream()
         .map((buffer) => new protos.BluetoothState.fromBuffer(buffer))
         .map((s) => BluetoothState.values[s.state.value]);
   }
 
-  /// Starts a scan for Bluetooth Low Energy devices
-  /// Timeout closes the stream after a specified [Duration]
+  /// Retrieve a list of connected devices
+  Future<List<BluetoothDevice>> get connectedDevices {
+    return _channel
+        .invokeMethod('getConnectedDevices')
+        .then((buffer) => protos.ConnectedDevicesResponse.fromBuffer(buffer))
+        .then((p) => p.devices)
+        .then((p) => p.map((d) => BluetoothDevice.fromProto(d)).toList());
+  }
+
+  _setLogLevelIfAvailable() async {
+    if (await isAvailable) {
+      // Send the log level to the underlying platforms.
+      setLogLevel(logLevel);
+    }
+  }
+
+  /// Starts a scan for Bluetooth Low Energy devices and returns a stream
+  /// of the [ScanResult] results as they are received.
+  ///
+  /// timeout calls stopStream after a specified [Duration].
+  /// You can also get a list of ongoing results in the [scanResults] stream.
+  /// If scanning is already in progress, this will throw an [Exception].
   Stream<ScanResult> scan({
     ScanMode scanMode = ScanMode.lowLatency,
     List<Guid> withServices = const [],
     List<Guid> withDevices = const [],
     Duration timeout,
+    bool allowDuplicates = false,
   }) async* {
     var settings = protos.ScanSettings.create()
       ..androidScanMode = scanMode.value
+      ..allowDuplicates = allowDuplicates
       ..serviceUuids.addAll(withServices.map((g) => g.toString()).toList());
-    StreamSubscription subscription;
-    StreamController controller;
-    controller = new StreamController(
-      onListen: () {
-        if (timeout != null) {
-          new Future.delayed(timeout, () => controller.close());
-        }
-      },
-      onCancel: () {
-        _stopScan();
-        subscription.cancel();
-      },
-    );
 
-    await _channel.invokeMethod('startScan', settings.writeToBuffer());
+    if (_isScanning.value == true) {
+      throw Exception('Another scan is already in progress.');
+    }
 
-    subscription = _scanResultChannel.receiveBroadcastStream().listen(
-          controller.add,
-          onError: controller.addError,
-          onDone: controller.close,
-        );
+    // Emit to isScanning
+    _isScanning.add(true);
 
-    yield* controller.stream
+    final killStreams = <Stream>[];
+    killStreams.add(_stopScanPill);
+    if (timeout != null) {
+      killStreams.add(Rx.timer(null, timeout));
+    }
+
+    // Clear scan results list
+    _scanResults.add(<ScanResult>[]);
+
+    try {
+      await _channel.invokeMethod('startScan', settings.writeToBuffer());
+    } catch (e) {
+      print('Error starting scan.');
+      _stopScanPill.add(null);
+      _isScanning.add(false);
+      throw e;
+    }
+
+    yield* FlutterBlue.instance._methodStream
+        .where((m) => m.method == "ScanResult")
+        .map((m) => m.arguments)
+        .takeUntil(Rx.merge(killStreams))
+        .doOnDone(stopScan)
         .map((buffer) => new protos.ScanResult.fromBuffer(buffer))
-        .map((p) => new ScanResult.fromProto(p));
+        .map((p) {
+      final result = new ScanResult.fromProto(p);
+      final list = _scanResults.value;
+      int index = list.indexOf(result);
+      if (index != -1) {
+        list[index] = result;
+      } else {
+        list.add(result);
+      }
+      _scanResults.add(list);
+      return result;
+    });
+  }
+
+  /// Starts a scan and returns a future that will complete once the scan has finished.
+  /// 
+  /// Once a scan is started, call [stopScan] to stop the scan and complete the returned future.
+  ///
+  /// timeout automatically stops the scan after a specified [Duration].
+  ///
+  /// To observe the results while the scan is in progress, listen to the [scanResults] stream, 
+  /// or call [scan] instead.
+  Future startScan({
+    ScanMode scanMode = ScanMode.lowLatency,
+    List<Guid> withServices = const [],
+    List<Guid> withDevices = const [],
+    Duration timeout,
+    bool allowDuplicates = false,
+  }) async {
+    await scan(
+            scanMode: scanMode,
+            withServices: withServices,
+            withDevices: withDevices,
+            timeout: timeout,
+            allowDuplicates: allowDuplicates)
+        .drain();
+    return _scanResults.value;
   }
 
   /// Stops a scan for Bluetooth Low Energy devices
-  Future _stopScan() => _channel.invokeMethod('stopScan');
-
-  /// Establishes a connection to the Bluetooth Device.
-  /// Returns a stream of [BluetoothDeviceState]
-  /// Timeout closes the stream after a specified [Duration]
-  /// To cancel connection to device, simply cancel() the stream subscription
-  Stream<BluetoothDeviceState> connect(
-    BluetoothDevice device, {
-    Duration timeout,
-    bool autoConnect = true,
-  }) async* {
-    var request = protos.ConnectRequest.create()
-      ..remoteId = device.id.toString()
-      ..androidAutoConnect = autoConnect;
-    var connected = false;
-    StreamSubscription subscription;
-    StreamController controller;
-    controller = new StreamController<BluetoothDeviceState>(
-      onListen: () {
-        if (timeout != null) {
-          new Future.delayed(
-              timeout, () => (!connected) ? controller.close() : null);
-        }
-      },
-      onCancel: () {
-        _cancelConnection(device);
-        subscription.cancel();
-      },
-    );
-
-    await _channel.invokeMethod('connect', request.writeToBuffer());
-
-    subscription = device.onStateChanged().listen(
-      (data) {
-        if (data == BluetoothDeviceState.connected) {
-          _log(LogLevel.info, 'connected!');
-          connected = true;
-        }
-        controller.add(data);
-      },
-      onError: controller.addError,
-      onDone: controller.close,
-    );
-
-    yield* controller.stream;
+  Future stopScan() async {
+    await _channel.invokeMethod('stopScan');
+    _stopScanPill.add(null);
+    _isScanning.add(false);
   }
 
-  /// Cancels connection to the Bluetooth Device
-  Future _cancelConnection(BluetoothDevice device) =>
-      _channel.invokeMethod('disconnect', device.id.toString());
+  /// The list of connected peripherals can include those that are connected
+  /// by other apps and that will need to be connected locally using the
+  /// device.connect() method before they can be used.
+//  Stream<List<BluetoothDevice>> connectedDevices({
+//    List<Guid> withServices = const [],
+//  }) =>
+//      throw UnimplementedError();
 
   /// Sets the log level of the FlutterBlue instance
   /// Messages equal or below the log level specified are stored/forwarded,
@@ -223,6 +258,21 @@ class ScanResult {
   final BluetoothDevice device;
   final AdvertisementData advertisementData;
   final int rssi;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ScanResult &&
+          runtimeType == other.runtimeType &&
+          device == other.device;
+
+  @override
+  int get hashCode => device.hashCode;
+
+  @override
+  String toString() {
+    return 'ScanResult{device: $device, advertisementData: $advertisementData, rssi: $rssi}';
+  }
 }
 
 class AdvertisementData {
@@ -249,4 +299,9 @@ class AdvertisementData {
         manufacturerData = p.manufacturerData,
         serviceData = p.serviceData,
         serviceUuids = p.serviceUuids;
+
+  @override
+  String toString() {
+    return 'AdvertisementData{localName: $localName, txPowerLevel: $txPowerLevel, connectable: $connectable, manufacturerData: $manufacturerData, serviceData: $serviceData, serviceUuids: $serviceUuids}';
+  }
 }
