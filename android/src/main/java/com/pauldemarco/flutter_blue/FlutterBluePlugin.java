@@ -4,7 +4,6 @@
 
 package com.pauldemarco.flutter_blue;
 
-import android.app.Activity;
 import android.Manifest;
 import android.annotation.TargetApi;
 import android.app.Application;
@@ -29,6 +28,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelUuid;
 import android.util.Log;
 
@@ -45,7 +46,6 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
-import io.flutter.embedding.engine.plugins.activity.ActivityAware;
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
@@ -57,11 +57,10 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
 import io.flutter.plugin.common.PluginRegistry;
 import io.flutter.plugin.common.PluginRegistry.Registrar;
-import io.flutter.plugin.common.PluginRegistry.RequestPermissionsResultListener;
 
 
 /** FlutterBluePlugin */
-public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCallHandler, RequestPermissionsResultListener  {
+public class FlutterBluePlugin implements FlutterPlugin, MethodCallHandler  {
     private static final String TAG = "FlutterBluePlugin";
     private Object initializationLock = new Object();
     private Context context;
@@ -75,7 +74,6 @@ public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCa
     private FlutterPluginBinding pluginBinding;
     private ActivityPluginBinding activityBinding;
     private Application application;
-    private Activity activity;
 
     private static final int REQUEST_FINE_LOCATION_PERMISSIONS = 1452;
     static final private UUID CCCD_ID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
@@ -91,12 +89,11 @@ public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCa
     /** Plugin registration. */
     public static void registerWith(Registrar registrar) {
         FlutterBluePlugin instance = new FlutterBluePlugin();
-        Activity activity = registrar.activity();
         Application application = null;
         if (registrar.context() != null) {
             application = (Application) (registrar.context().getApplicationContext());
         }
-        instance.setup(registrar.messenger(), application, activity, registrar, null);
+        instance.setup(registrar.messenger(), application);
     }
 
     public FlutterBluePlugin() {}
@@ -109,44 +106,16 @@ public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCa
     @Override
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
         pluginBinding = null;
-
-    }
-
-    @Override
-    public void onAttachedToActivity(ActivityPluginBinding binding) {
-        activityBinding = binding;
         setup(
                 pluginBinding.getBinaryMessenger(),
-                (Application) pluginBinding.getApplicationContext(),
-                activityBinding.getActivity(),
-                null,
-                activityBinding);
-    }
-
-    @Override
-    public void onDetachedFromActivity() {
-        tearDown();
-    }
-
-    @Override
-    public void onDetachedFromActivityForConfigChanges() {
-        onDetachedFromActivity();
-    }
-
-    @Override
-    public void onReattachedToActivityForConfigChanges(ActivityPluginBinding binding) {
-        onAttachedToActivity(binding);
+                (Application) pluginBinding.getApplicationContext());
     }
 
     private void setup(
             final BinaryMessenger messenger,
-            final Application application,
-            final Activity activity,
-            final PluginRegistry.Registrar registrar,
-            final ActivityPluginBinding activityBinding) {
+            final Application application) {
         synchronized (initializationLock) {
             Log.i(TAG, "setup");
-            this.activity = activity;
             this.application = application;
             this.context = application;
             channel = new MethodChannel(messenger, NAMESPACE + "/methods");
@@ -155,30 +124,8 @@ public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCa
             stateChannel.setStreamHandler(stateHandler);
             mBluetoothManager = (BluetoothManager) application.getSystemService(Context.BLUETOOTH_SERVICE);
             mBluetoothAdapter = mBluetoothManager.getAdapter();
-            if (registrar != null) {
-                // V1 embedding setup for activity listeners.
-                registrar.addRequestPermissionsResultListener(this);
-            } else {
-                // V2 embedding setup for activity listeners.
-                activityBinding.addRequestPermissionsResultListener(this);
-            }
         }
     }
-
-    private void tearDown() {
-        Log.i(TAG, "teardown");
-        context = null;
-        activityBinding.removeRequestPermissionsResultListener(this);
-        activityBinding = null;
-        channel.setMethodCallHandler(null);
-        channel = null;
-        stateChannel.setStreamHandler(null);
-        stateChannel = null;
-        mBluetoothAdapter = null;
-        mBluetoothManager = null;
-        application = null;
-    }
-
 
     @Override
     public void onMethodCall(MethodCall call, Result result) {
@@ -635,23 +582,6 @@ public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCa
         }
     }
 
-    @Override
-    public boolean onRequestPermissionsResult(
-            int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode == REQUEST_FINE_LOCATION_PERMISSIONS) {
-            if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                startScan(pendingCall, pendingResult);
-            } else {
-                pendingResult.error(
-                        "no_permissions", "flutter_blue plugin requires location permissions for scanning", null);
-                pendingResult = null;
-                pendingCall = null;
-            }
-            return true;
-        }
-        return false;
-    }
-
     private BluetoothGatt locateGatt(String remoteId) throws Exception {
         BluetoothDeviceCache cache = mDevices.get(remoteId);
         if(cache == null || cache.gatt == null) {
@@ -995,13 +925,12 @@ public class FlutterBluePlugin implements FlutterPlugin, ActivityAware, MethodCa
 
     private void invokeMethodUIThread(final String name, final byte[] byteArray)
     {
-        activity.runOnUiThread(
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        channel.invokeMethod(name, byteArray);
-                    }
-                });
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                channel.invokeMethod(name, byteArray);
+            }
+        });
     }
 
     // BluetoothDeviceCache contains any other cached information not stored in Android Bluetooth API
