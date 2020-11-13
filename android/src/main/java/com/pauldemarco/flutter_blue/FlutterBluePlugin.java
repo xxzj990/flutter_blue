@@ -4,7 +4,6 @@
 
 package com.pauldemarco.flutter_blue;
 
-import android.Manifest;
 import android.annotation.TargetApi;
 import android.app.Application;
 import android.bluetooth.BluetoothAdapter;
@@ -26,7 +25,6 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -42,11 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import androidx.core.app.ActivityCompat;
-import androidx.core.content.ContextCompat;
-
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
-import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.EventChannel.EventSink;
@@ -55,7 +49,6 @@ import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
-import io.flutter.plugin.common.PluginRegistry;
 import io.flutter.plugin.common.PluginRegistry.Registrar;
 
 
@@ -72,7 +65,6 @@ public class FlutterBluePlugin implements FlutterPlugin, MethodCallHandler  {
     private BluetoothAdapter mBluetoothAdapter;
 
     private FlutterPluginBinding pluginBinding;
-    private ActivityPluginBinding activityBinding;
     private Application application;
 
     private static final int REQUEST_FINE_LOCATION_PERMISSIONS = 1452;
@@ -101,14 +93,17 @@ public class FlutterBluePlugin implements FlutterPlugin, MethodCallHandler  {
     @Override
     public void onAttachedToEngine(FlutterPluginBinding binding) {
         pluginBinding = binding;
+
+        setup(
+                pluginBinding.getBinaryMessenger(),
+                (Application) pluginBinding.getApplicationContext());
     }
 
     @Override
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
         pluginBinding = null;
-        setup(
-                pluginBinding.getBinaryMessenger(),
-                (Application) pluginBinding.getApplicationContext());
+
+        tearDown();
     }
 
     private void setup(
@@ -125,6 +120,18 @@ public class FlutterBluePlugin implements FlutterPlugin, MethodCallHandler  {
             mBluetoothManager = (BluetoothManager) application.getSystemService(Context.BLUETOOTH_SERVICE);
             mBluetoothAdapter = mBluetoothManager.getAdapter();
         }
+    }
+
+    private void tearDown() {
+        Log.i(TAG, "teardown");
+        context = null;
+        channel.setMethodCallHandler(null);
+        channel = null;
+        stateChannel.setStreamHandler(null);
+        stateChannel = null;
+        mBluetoothAdapter = null;
+        mBluetoothManager = null;
+        application = null;
     }
 
     @Override
@@ -185,18 +192,6 @@ public class FlutterBluePlugin implements FlutterPlugin, MethodCallHandler  {
 
             case "startScan":
             {
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
-                        != PackageManager.PERMISSION_GRANTED) {
-                    ActivityCompat.requestPermissions(
-                            activityBinding.getActivity(),
-                            new String[] {
-                                    Manifest.permission.ACCESS_FINE_LOCATION
-                            },
-                            REQUEST_FINE_LOCATION_PERMISSIONS);
-                    pendingCall = call;
-                    pendingResult = result;
-                    break;
-                }
                 startScan(call, result);
                 break;
             }
